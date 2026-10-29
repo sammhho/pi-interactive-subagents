@@ -1265,6 +1265,7 @@ export async function pollForExit(
     sentinelFile?: string;
     onTick?: (elapsed: number) => void;
   },
+  readScreen: typeof readScreenAsync = readScreenAsync,
 ): Promise<PollResult> {
   const start = Date.now();
 
@@ -1296,12 +1297,15 @@ export async function pollForExit(
 
     // Slow path: read terminal screen for sentinel (crash detection)
     try {
-      const screen = await readScreenAsync(surface, 5);
+      const screen = await readScreen(surface, 5);
+      if (signal.aborted) throw new Error("Aborted while waiting for subagent to finish");
       const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
       if (match) {
         return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
       }
     } catch {
+      // A late screen read must not consume a resumed watcher's sidecar.
+      if (signal.aborted) throw new Error("Aborted while waiting for subagent to finish");
       // Surface may have been destroyed — check if .exit file appeared in the meantime
       if (options.sessionFile) {
         try {
