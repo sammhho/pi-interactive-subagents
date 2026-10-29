@@ -1,6 +1,6 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, appendFileSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -19,6 +19,7 @@ import {
 
 import {
   shellEscape,
+  pollForExit,
   isCmuxAvailable,
   isWezTermAvailable,
   parseCmuxFocusedSnapshot,
@@ -80,18 +81,22 @@ function withTempDir(run: (dir: string) => void) {
 
 function createMockExtensionApi() {
   const registeredTools: Array<any> = [];
+  const handlers = new Map<string, (...args: any[]) => any>();
   const registeredCommands: Array<any> = [];
   const registeredMessageRenderers: Array<any> = [];
   const sentUserMessages: string[] = [];
   const sentMessages: Array<any> = [];
   return {
     registeredTools,
+    handlers,
     registeredCommands,
     registeredMessageRenderers,
     sentUserMessages,
     sentMessages,
     api: {
-      on() {},
+      on(event: string, handler: (...args: any[]) => any) {
+        handlers.set(event, handler);
+      },
       registerTool(tool: any) {
         registeredTools.push(tool);
       },
@@ -1342,6 +1347,35 @@ describe("cmux.ts interpretExitSidecar", () => {
     assert.deepEqual(interpretExitSidecar(null), { reason: "done", exitCode: 0 });
   });
 });
+describe("poll cancellation", () => {
+  for (const screenFails of [false, true]) {
+    it(`does not consume a new sidecar after an aborted ${screenFails ? "failed" : "successful"} screen read`, async () => {
+      const dir = createTestDir();
+      try {
+        const sessionFile = join(dir, "child.jsonl");
+        const abort = new AbortController();
+        let settle!: (value: string) => void;
+        let fail!: (error: Error) => void;
+        const screen = new Promise<string>((resolve, reject) => { settle = resolve; fail = reject; });
+        let ticks = 0;
+        const polling = pollForExit("pane", abort.signal, {
+          interval: 1, sessionFile, onTick: () => ticks++,
+        }, () => screen);
+        const rejected = assert.rejects(polling, /aborted/i);
+        abort.abort();
+        writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "ping", name: "new" }));
+        if (screenFails) fail(new Error("pane closed"));
+        else settle("__SUBAGENT_DONE_0__");
+        await rejected;
+        assert.equal(readFileSync(`${sessionFile}.exit`, "utf8"), JSON.stringify({ type: "ping", name: "new" }));
+        assert.equal(ticks, 0);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
 describe("commands", () => {
   it("/iterate always emits a full-context fork tool call", () => {
     const { api, registeredCommands, sentUserMessages } = createMockExtensionApi();
@@ -2375,4 +2409,419 @@ describe("cmux.ts", () => {
       assert.equal(typeof result, "boolean");
     });
   });
+});
+
+// Exercise the registered production handlers rather than a parallel lifecycle model.
+describe("extension lifecycle", () => {
+  function deferred<T>() {
+    let resolve!: (value: T) => void;
+    let reject!: (reason: unknown) => void;
+    const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+    return { promise, resolve, reject };
+  }
+
+  const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
+  const assistantEntry = (text: string) => ({
+    type: "message", id: text, message: { role: "assistant", content: [{ type: "text", text }] },
+  });
+
+  async function fixture(run: (f: any) => Promise<void>, overrides: Record<string, any> = {}) {
+    const dir = createTestDir();
+    const oldDelay = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
+    const oldConfig = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
+    process.env.PI_CODING_AGENT_DIR = join(dir, "agent");
+    const parentFile = createSessionFile(dir, [assistantEntry("parent")]);
+    const widgets: any[] = [];
+    const ctx = {
+      cwd: dir, hasUI: true,
+      ui: { setWidget: (...args: any[]) => widgets.push(args) },
+      sessionManager: {
+        getSessionFile: () => parentFile,
+        getSessionId: () => "parent-id",
+        getSessionDir: () => dir,
+      },
+    };
+    const polls: any[] = [];
+    const closed: string[] = [];
+    const commands: any[] = [];
+    let surfaceId = 0;
+    const restore = (subagentsModule as any).__test__.setMuxOverrides({
+      isMuxAvailable: () => true,
+      createSurface: () => `pane-${++surfaceId}`,
+      sendLongCommand: (...args: any[]) => commands.push(args),
+      pollForExit: (surface: string, signal: AbortSignal, options: any) => {
+        const pending = deferred<any>();
+        polls.push({ surface, signal, options, ...pending });
+        return pending.promise;
+      },
+      closeSurface: (surface: string) => closed.push(surface),
+      readScreen: () => "",
+      ...overrides,
+    });
+    const instances: any[] = [];
+    function createInstance() {
+      const mock = createMockExtensionApi();
+      (subagentsModule as any).default(mock.api);
+      mock.handlers.get("session_start")!({}, ctx);
+      instances.push(mock);
+      return mock;
+    }
+    function execute(mock: any, name: string, params: any) {
+      const tool = mock.registeredTools.find((candidate: any) => candidate.name === name);
+      assert.ok(tool, `missing tool ${name}`);
+      return tool.execute("call", params, new AbortController().signal, undefined, ctx);
+    }
+    async function shutdown(mock: any) {
+      await mock.handlers.get("session_shutdown")!({}, ctx);
+    }
+    try {
+      await run({ dir, ctx, widgets, polls, closed, commands, createInstance, execute, shutdown });
+    } finally {
+      // Settle even deliberately non-cooperative mock polls before retiring owners.
+      for (const poll of polls) poll.resolve({ exitCode: 0 });
+      for (const instance of instances) await shutdown(instance);
+      await flush();
+      restore();
+      restoreEnvVar("PI_SUBAGENT_SHELL_READY_DELAY_MS", oldDelay);
+      restoreEnvVar("PI_CODING_AGENT_DIR", oldConfig);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  it("clears the status timer on retirement and ignores an already-queued tick", async () => {
+    const originalSetInterval = globalThis.setInterval;
+    const originalClearInterval = globalThis.clearInterval;
+    const intervals: Array<{ callback: () => void; handle: ReturnType<typeof setInterval> }> = [];
+    const cleared = new Set<ReturnType<typeof setInterval>>();
+    globalThis.setInterval = ((callback: () => void, delay: number) => {
+      const handle = originalSetInterval(callback, delay);
+      intervals.push({ callback, handle });
+      return handle;
+    }) as typeof setInterval;
+    globalThis.clearInterval = ((handle: ReturnType<typeof setInterval>) => {
+      cleared.add(handle);
+      originalClearInterval(handle);
+    }) as typeof clearInterval;
+    try {
+      await fixture(async (f) => {
+        const old = f.createInstance();
+        await f.execute(old, "subagent", { name: "Old", task: "work", interactive: false });
+        assert.equal(intervals.length, 2, "widget and status timers should be installed");
+        const statusTimer = intervals[1];
+        const now = Date.now();
+        withMockedNow(now, () => statusTimer.callback());
+        withMockedNow(now + 61_000, () => statusTimer.callback());
+        assert.equal(old.sentMessages.length, 1);
+        assert.equal(old.sentMessages[0].message.customType, "subagent_status");
+        assert.match(old.sentMessages[0].message.content, /stalled/);
+
+        const current = f.createInstance();
+        assert.ok(cleared.has(statusTimer.handle), "retirement must clear the status timer");
+        await f.execute(current, "subagent", { name: "New", task: "work", interactive: false });
+        const widgetsBeforeTick = f.widgets.length;
+        withMockedNow(now + 122_000, () => statusTimer.callback());
+        assert.equal(f.widgets.length, widgetsBeforeTick);
+        assert.equal(old.sentMessages.length, 1);
+        assert.equal(current.sentMessages.length, 0);
+        assert.equal(f.polls[1].signal.aborted, false);
+      });
+    } finally {
+      globalThis.setInterval = originalSetInterval;
+      globalThis.clearInterval = originalClearInterval;
+    }
+  });
+
+  it("launches a Claude-backed agent and delivers screen output on completion", async () => {
+    const screens: string[] = [];
+    await fixture(async (f) => {
+      writeAgentFile(join(f.dir, "agent", "agents"), "claude-test", [
+        "name: claude-test", "cli: claude", "auto-exit: true",
+      ].join("\n"));
+      const mock = f.createInstance();
+      const started = await f.execute(mock, "subagent", {
+        name: "Claude", agent: "claude-test", task: "do work", resumeSessionId: "session-123",
+      });
+      assert.equal(started.details.status, "started");
+      assert.match(f.commands[0][1], /claude --dangerously-skip-permissions/);
+      assert.match(f.commands[0][1], /--resume 'session-123'/);
+      assert.match(f.polls[0].options.sentinelFile, /^\/tmp\/pi-claude-.*-done$/);
+      f.polls[0].options.onTick();
+      f.polls[0].resolve({ exitCode: 0 });
+      await flush();
+      assert.deepEqual(screens, ["pane-1"]);
+      assert.equal(mock.sentMessages.length, 1);
+      assert.equal(mock.sentMessages[0].message.customType, "subagent_result");
+      assert.match(mock.sentMessages[0].message.content, /Claude answer/);
+      assert.doesNotMatch(mock.sentMessages[0].message.content, /__SUBAGENT_DONE_/);
+      assert.deepEqual(f.closed, ["pane-1"]);
+    }, { readScreen: (surface: string) => { screens.push(surface); return "Claude answer\n__SUBAGENT_DONE_0__"; } });
+  });
+
+  it("does not read Claude output or deliver a result after retirement", async () => {
+    const screens: string[] = [];
+    await fixture(async (f) => {
+      writeAgentFile(join(f.dir, "agent", "agents"), "claude-test", "name: claude-test\ncli: claude\nauto-exit: true");
+      const old = f.createInstance();
+      await f.execute(old, "subagent", { name: "Claude", agent: "claude-test", task: "work" });
+      const poll = f.polls[0];
+      f.createInstance();
+      assert.equal(poll.signal.aborted, true);
+      const widgetsAfterRetirement = f.widgets.length;
+      poll.options.onTick();
+      poll.resolve({ exitCode: 0 });
+      await flush();
+      assert.deepEqual(screens, []);
+      assert.equal(old.sentMessages.length, 0);
+      assert.equal(f.widgets.length, widgetsAfterRetirement);
+      assert.deepEqual(f.closed, ["pane-1"]);
+    }, { readScreen: (surface: string) => { screens.push(surface); return "late output"; } });
+  });
+
+  it("delivers one result and closes the pane on normal spawn completion", async () => {
+    await fixture(async (f) => {
+      const mock = f.createInstance();
+      const started = await f.execute(mock, "subagent", { name: "Worker", task: "Do work" });
+      assert.equal(started.details.status, "started");
+      assert.equal(mock.sentMessages.length, 0);
+      assert.equal(f.commands.length, 1);
+      assert.equal(f.polls.length, 1);
+      writeFileSync(started.details.sessionFile, JSON.stringify(assistantEntry("finished work")) + "\n");
+      f.polls[0].resolve({ exitCode: 0 });
+      await flush();
+      assert.deepEqual(f.closed, ["pane-1"]);
+      assert.equal(mock.sentMessages.length, 1);
+      assert.equal(mock.sentMessages[0].message.customType, "subagent_result");
+      assert.match(mock.sentMessages[0].message.content, /finished work/);
+      assert.deepEqual(mock.sentMessages[0].options, { triggerTurn: true, deliverAs: "steer" });
+      await f.shutdown(mock);
+      assert.deepEqual(f.closed, ["pane-1"]);
+    });
+  });
+
+  it("resume reports only newly appended assistant output", async () => {
+    await fixture(async (f) => {
+      const mock = f.createInstance();
+      const sessionPath = createSessionFile(f.dir, [assistantEntry("old answer")]);
+      const started = await f.execute(mock, "subagent_resume", { sessionPath, name: "Resumed", message: "continue" });
+      assert.equal(started.details.status, "started");
+      appendFileSync(sessionPath, JSON.stringify(assistantEntry("new answer")) + "\n");
+      f.polls[0].resolve({ exitCode: 0 });
+      await flush();
+      assert.equal(mock.sentMessages.length, 1);
+      assert.match(mock.sentMessages[0].message.content, /new answer/);
+      assert.doesNotMatch(mock.sentMessages[0].message.content, /old answer/);
+      assert.deepEqual(f.closed, ["pane-1"]);
+    });
+  });
+
+  for (const tool of ["subagent", "subagent_resume"]) {
+    it(`${tool}: shutdown during shell startup closes the pane and prevents launch`, async () => {
+      await fixture(async (f) => {
+        const mock = f.createInstance();
+        const params = tool === "subagent"
+          ? { name: "Worker", task: "work" }
+          : { sessionPath: createSessionFile(f.dir, []) };
+        const launch = f.execute(mock, tool, params);
+        // Attach immediately so rejection during shutdown cannot be unhandled.
+        const outcome = assert.rejects(launch, /shut down/i);
+        assert.deepEqual(f.closed, []);
+        const shutdown = f.shutdown(mock);
+        assert.deepEqual(f.closed, ["pane-1"]);
+        await outcome;
+        await shutdown;
+        assert.deepEqual(f.closed, ["pane-1"]);
+        assert.equal(f.commands.length, 0);
+        assert.equal(f.polls.length, 0);
+        assert.equal(mock.sentMessages.length, 0);
+      });
+    });
+
+    it(`${tool}: shutdown aborts watcher and suppresses late completion`, async () => {
+      await fixture(async (f) => {
+        const mock = f.createInstance();
+        const params = tool === "subagent"
+          ? { name: "Worker", task: "work" }
+          : { sessionPath: createSessionFile(f.dir, []) };
+        await f.execute(mock, tool, params);
+        const poll = f.polls[0];
+        const shutdown = f.shutdown(mock);
+        assert.equal(poll.signal.aborted, true);
+        assert.deepEqual(f.closed, ["pane-1"]);
+        const widgetCount = f.widgets.length;
+        poll.options.onTick();
+        poll.resolve({ exitCode: 0, ping: { name: "Worker", message: "help" } });
+        await shutdown;
+        await flush();
+        assert.equal(mock.sentMessages.length, 0);
+        assert.equal(f.widgets.length, widgetCount);
+        assert.deepEqual(f.closed, ["pane-1"]);
+      });
+    });
+  }
+
+  it("replacing the extension retires only the old owner, including on late shutdown", async () => {
+    await fixture(async (f) => {
+      const old = f.createInstance();
+      await f.execute(old, "subagent", { name: "Old", task: "old" });
+      const oldPoll = f.polls[0];
+      const current = f.createInstance();
+      assert.equal(oldPoll.signal.aborted, true);
+      assert.deepEqual(f.closed, ["pane-1"]);
+      await f.execute(current, "subagent", { name: "New", task: "new" });
+      const newPoll = f.polls[1];
+      oldPoll.resolve({ exitCode: 0 });
+      await f.shutdown(old);
+      assert.equal(newPoll.signal.aborted, false);
+      assert.deepEqual(f.closed, ["pane-1"]);
+      newPoll.resolve({ exitCode: 0 });
+      await flush();
+      assert.equal(old.sentMessages.length, 0);
+      assert.equal(current.sentMessages.length, 1);
+      assert.deepEqual(f.closed, ["pane-1", "pane-2"]);
+    });
+  });
+
+  for (const reason of ["new", "resume", "fork", "reload"]) {
+    for (const tool of ["subagent", "subagent_resume"]) {
+      it(`${reason}: cached factory creates a fresh ${tool} watcher`, async () => {
+        await fixture(async (f) => {
+          const old = f.createInstance();
+          await f.execute(old, "subagent", { name: "Old", task: "old" });
+          const outgoingPoll = f.polls[0];
+          const stopping = old.handlers.get("session_shutdown")({ reason }, f.ctx);
+          outgoingPoll.resolve({ exitCode: 0 });
+          await stopping;
+          await old.handlers.get("session_shutdown")({ reason }, f.ctx);
+          const replacement = f.createInstance();
+          const params = tool === "subagent"
+            ? { name: "Fresh", task: "work" }
+            : { name: "Fresh", sessionPath: createSessionFile(f.dir, []) };
+          await f.execute(replacement, tool, params);
+          assert.equal(f.polls[1].signal.aborted, false);
+          assert.deepEqual(f.closed, ["pane-1"]);
+          f.polls[1].resolve({ exitCode: 0 });
+          await flush();
+          assert.equal(old.sentMessages.length, 0);
+          assert.equal(replacement.sentMessages.length, 1);
+          assert.equal(replacement.sentMessages[0].message.customType, "subagent_result");
+          assert.deepEqual(f.closed, ["pane-1", "pane-2"]);
+        });
+      });
+    }
+  }
+
+  it("shutdown is bounded when polling ignores cancellation", async () => {
+    await fixture(async (f) => {
+      const mock = f.createInstance();
+      await f.execute(mock, "subagent", { name: "Old", task: "work" });
+      const start = Date.now();
+      await f.shutdown(mock);
+      assert.ok(Date.now() - start < 1000);
+      assert.equal(f.polls[0].signal.aborted, true);
+      assert.deepEqual(f.closed, ["pane-1"]);
+      assert.equal(mock.sentMessages.length, 0);
+    });
+  });
+
+  it("reports watcher failure and still closes the owned surface once", async () => {
+    await fixture(async (f) => {
+      const mock = f.createInstance();
+      await f.execute(mock, "subagent", { name: "Worker", task: "work" });
+      f.polls[0].reject(new Error("poll failed"));
+      await flush();
+      assert.deepEqual(f.closed, ["pane-1"]);
+      assert.equal(mock.sentMessages.length, 1);
+      assert.match(mock.sentMessages[0].message.content, /poll failed/);
+      await f.shutdown(mock);
+      assert.deepEqual(f.closed, ["pane-1"]);
+    });
+  });
+  it("restarting a session on the same extension retires the previous watcher", async () => {
+    await fixture(async (f) => {
+      const mock = f.createInstance();
+      await f.execute(mock, "subagent", { name: "Old", task: "old" });
+      const oldPoll = f.polls[0];
+      mock.handlers.get("session_start")({}, f.ctx);
+      assert.equal(oldPoll.signal.aborted, true);
+      assert.deepEqual(f.closed, ["pane-1"]);
+      await f.execute(mock, "subagent", { name: "New", task: "new" });
+      oldPoll.resolve({ exitCode: 0 });
+      await flush();
+      assert.equal(mock.sentMessages.length, 0);
+      assert.equal(f.polls[1].signal.aborted, false);
+      f.polls[1].resolve({ exitCode: 0 });
+      await flush();
+      assert.equal(mock.sentMessages.length, 1);
+      assert.equal(mock.sentMessages[0].message.details.name, "New");
+      assert.deepEqual(f.closed, ["pane-1", "pane-2"]);
+    });
+  });
+
+  for (const tool of ["subagent", "subagent_resume"]) {
+    it(`${tool}: command delivery failure closes its surface without starting a watcher`, async () => {
+      await fixture(async (f) => {
+        const mock = f.createInstance();
+        const params = tool === "subagent"
+          ? { name: "Worker", task: "work" }
+          : { sessionPath: createSessionFile(f.dir, []) };
+        await assert.rejects(f.execute(mock, tool, params), /send failed/);
+        assert.deepEqual(f.closed, ["pane-1"]);
+        assert.equal(f.polls.length, 0);
+        assert.equal(mock.sentMessages.length, 0);
+        await f.shutdown(mock);
+        assert.deepEqual(f.closed, ["pane-1"]);
+      }, { sendLongCommand: () => { throw new Error("send failed"); } });
+    });
+  }
+
+  it("delivers a ping instead of a result when the child requests help", async () => {
+    await fixture(async (f) => {
+      const mock = f.createInstance();
+      const started = await f.execute(mock, "subagent", { name: "Worker", task: "work" });
+      f.polls[0].resolve({ exitCode: 0, ping: { name: "Worker", message: "need help" } });
+      await flush();
+      assert.equal(mock.sentMessages.length, 1);
+      assert.equal(mock.sentMessages[0].message.customType, "subagent_ping");
+      assert.match(mock.sentMessages[0].message.content, /need help/);
+      assert.equal(mock.sentMessages[0].message.details.sessionFile, started.details.sessionFile);
+      assert.deepEqual(f.closed, ["pane-1"]);
+    });
+  });
+
+
+  it("a failed close does not suppress completion or trigger another close on shutdown", async () => {
+    const closes: string[] = [];
+    await fixture(async (f) => {
+      const mock = f.createInstance();
+      await f.execute(mock, "subagent", { name: "Worker", task: "work" });
+      f.polls[0].resolve({ exitCode: 0 });
+      await flush();
+      assert.deepEqual(closes, ["pane-1"]);
+      assert.equal(mock.sentMessages.length, 1);
+      await f.shutdown(mock);
+      assert.deepEqual(closes, ["pane-1"]);
+    }, { closeSurface: (surface: string) => { closes.push(surface); throw new Error("close failed"); } });
+  });
+
+  for (const tool of ["subagent", "subagent_resume"]) {
+    for (const ping of [false, true]) {
+      it(`${tool}: does not retry ${ping ? "ping" : "result"} delivery if sendMessage throws`, async () => {
+        await fixture(async (f) => {
+          const mock = f.createInstance();
+          let sends = 0;
+          mock.api.sendMessage = () => { sends++; throw new Error("delivery failed"); };
+          const params = tool === "subagent"
+            ? { name: "Worker", task: "work" }
+            : { name: "Worker", sessionPath: createSessionFile(f.dir, []) };
+          await f.execute(mock, tool, params);
+          f.polls[0].resolve({ exitCode: 0, ...(ping ? { ping: { name: "Worker", message: "help" } } : {}) });
+          await flush();
+          assert.equal(sends, 1);
+          assert.deepEqual(f.closed, ["pane-1"]);
+        });
+      });
+    }
+  }
+
 });
