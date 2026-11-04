@@ -17,6 +17,7 @@ import {
   rmSync,
   existsSync,
   readFileSync,
+  writeFileSync,
   unlinkSync,
 } from "node:fs";
 import { join, resolve, dirname } from "node:path";
@@ -204,7 +205,12 @@ export function createTestEnv(backend: MuxBackend): TestEnv {
   if (existsSync(TEST_AGENTS_SRC)) {
     for (const file of readdirSync(TEST_AGENTS_SRC)) {
       if (file.endsWith(".md")) {
-        cpSync(join(TEST_AGENTS_SRC, file), join(agentsDir, file));
+        const destination = join(agentsDir, file);
+        cpSync(join(TEST_AGENTS_SRC, file), destination);
+        if (process.env.PI_TEST_MODEL) {
+          const definition = readFileSync(destination, "utf8");
+          writeFileSync(destination, definition.replace(/^model:.*$/m, `model: ${TEST_MODEL}`));
+        }
       }
     }
   }
